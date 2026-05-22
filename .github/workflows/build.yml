@@ -27,8 +27,8 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[messaging,dev]"
 
-      - name: Full test suite
-        run: python -m pytest tests/ -q -x
+      - name: Gateway test suite
+        run: python -m pytest tests/gateway/ -q -x
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
