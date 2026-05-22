@@ -25,10 +25,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[messaging,dev,acp]" websockets
+        run: pip install -e ".[messaging,dev,acp,web]" websockets
 
       - name: Gateway and core tests
-        run: python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/stress
+        run: python -m pytest tests/ -q --ignore=tests/e2e --ignore=tests/stress --continue-on-collection-errors
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
