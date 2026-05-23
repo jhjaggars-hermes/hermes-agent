@@ -1,0 +1,15 @@
+model:
+  provider: openai-codex
+  default: gpt-5.5
+  base_url: https://chatgpt.com/backend-api/codex
+  context_length: 262144
+memory:
+  provider: honcho
+discord:
+  require_mention: true
+  monitored_channels:
+    - "1243669190225694811"
+  mention_role_ids:
+    - "1507142227590385838"
+  auto_thread: true
+  thread_require_mention: false

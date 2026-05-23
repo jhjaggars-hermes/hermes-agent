@@ -19,6 +19,8 @@ RUN apt-get update && \
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
+# OpenShell sandbox requires a user named 'sandbox'; use same UID so all hermes-owned files are accessible
+RUN useradd -o -u 10000 -g hermes -M -d /opt/data -s /bin/bash sandbox
 
 COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
@@ -113,8 +115,13 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
-ENV HERMES_HOME=/opt/data
-ENV PATH="/opt/data/.local/bin:${PATH}"
-RUN mkdir -p /opt/data
+# In OpenShell sandboxes the workspace PVC is mounted at /sandbox; HERMES_HOME points there.
+# For legacy Docker usage (volume mounted at /opt/data) override with -e HERMES_HOME=/opt/data.
+ENV HERMES_HOME=/sandbox
+# Include venv bin on PATH so the supervisor can invoke `hermes` without the entrypoint running.
+ENV PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
+RUN mkdir -p /opt/data /sandbox && chown hermes:hermes /sandbox
+# Seed config copied into /sandbox so OpenShell's workspace-init populates the workspace PVC on first boot.
+COPY --chown=hermes:hermes docker/hermes-seed/ /sandbox/
 VOLUME [ "/opt/data" ]
 ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]

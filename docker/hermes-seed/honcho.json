@@ -1,0 +1,25 @@
+{
+  "recallMode": "hybrid",
+  "sessionStrategy": "per-session",
+  "dialecticCadence": 2,
+  "dialecticDepth": 1,
+  "writeFrequency": "async",
+  "saveMessages": true,
+  "observationMode": "directional",
+  "baseUrl": "http://honcho-api.honcho:8000",
+  "hosts": {
+    "hermes": {
+      "peerName": "user",
+      "aiPeer": "hermes",
+      "workspace": "hermes",
+      "observationMode": "directional",
+      "writeFrequency": "async",
+      "recallMode": "hybrid",
+      "dialecticCadence": 2,
+      "dialecticReasoningLevel": "low",
+      "sessionStrategy": "per-session",
+      "enabled": true,
+      "saveMessages": true
+    }
+  }
+}
