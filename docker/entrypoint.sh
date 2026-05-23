@@ -73,6 +73,29 @@ echo "docker" > "${HERMES_HOME:=/opt/data}/.install_method" 2>/dev/null || true
 # ephemeral and shared across profiles.  See issue #4426.
 mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
 
+# Fetch config from a cluster-internal config server if CONFIG_SERVER_URL is set.
+# Runs before the [ ! -f ] fallback checks so the server is the authoritative source.
+# Fetches config.yaml, honcho.json, .env, and kubeconfig (-> .kube/config).
+# Degrades gracefully — failures fall through to the baked-in image defaults below.
+if [ -n "${CONFIG_SERVER_URL:-}" ]; then
+    python3 - <<'PYEOF' || true
+import urllib.request, os, sys
+base = os.environ['CONFIG_SERVER_URL'].rstrip('/')
+home = os.environ.get('HERMES_HOME', '/sandbox')
+for url_path, dest in [
+    ('config.yaml', f'{home}/config.yaml'),
+    ('honcho.json', f'{home}/honcho.json'),
+    ('.env',        f'{home}/.env'),
+    ('kubeconfig',  f'{home}/.kube/config'),
+]:
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        urllib.request.urlretrieve(f'{base}/{url_path}', dest)
+    except Exception as e:
+        print(f'warning: could not fetch {url_path}: {e}', file=sys.stderr)
+PYEOF
+fi
+
 # .env
 if [ ! -f "$HERMES_HOME/.env" ]; then
     cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env"
