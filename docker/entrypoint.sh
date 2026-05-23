@@ -125,6 +125,20 @@ if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "$HERMES_AUTH_JSON_BOOTSTRAP" ]; th
     chmod 600 "$HERMES_HOME/auth.json"
 fi
 
+# Write gh CLI config from GITHUB_TOKEN so authenticated operations work without
+# the token being visible in subprocess environments (hermes scrubs secrets from
+# tool output). Overwrites on every start so PAT rotations are picked up automatically.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    mkdir -p "$HERMES_HOME/.config/gh"
+    cat > "$HERMES_HOME/.config/gh/hosts.yml" <<EOF
+github.com:
+    oauth_token: ${GITHUB_TOKEN}
+    git_protocol: https
+    user: jhjaggars
+EOF
+    chmod 600 "$HERMES_HOME/.config/gh/hosts.yml"
+fi
+
 # Sync bundled skills (manifest-based so user edits are preserved)
 if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
