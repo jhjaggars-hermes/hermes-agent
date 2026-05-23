@@ -19,8 +19,10 @@ RUN apt-get update && \
 
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
-# OpenShell sandbox requires a user named 'sandbox'; use same UID so all hermes-owned files are accessible
-RUN useradd -o -u 10000 -g hermes -M -d /opt/data -s /bin/bash sandbox
+# OpenShell sandbox requires a 'sandbox' user AND 'sandbox' group; use same UID as hermes
+# so all hermes-owned files remain accessible under the sandbox identity.
+RUN groupadd -g 10001 sandbox && \
+    useradd -o -u 10000 -g sandbox -M -d /opt/data -s /bin/bash sandbox
 
 COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
