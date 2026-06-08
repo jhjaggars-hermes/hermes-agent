@@ -533,6 +533,60 @@ class TestToolCallOutputBackfill:
             "content": {"ok": True},
         }]
 
+    def test_serialize_messages_skips_null_role_without_type(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        messages = [
+            {"no_role_key": "here"},
+            {"role": "user", "content": "hello"},
+        ]
+        result = mod._serialize_messages(messages)
+        assert result == [{"role": "user", "content": "hello"}]
+
+    def test_serialize_messages_codex_responses_function_call(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        messages = [
+            {"type": "function_call", "call_id": "c1", "name": "search", "arguments": '{"q": "test"}'},
+            {"role": "user", "content": "hi"},
+        ]
+        result = mod._serialize_messages(messages)
+        assert result == [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "name": "search", "arguments": {"q": "test"}}],
+            },
+            {"role": "user", "content": "hi"},
+        ]
+
+    def test_serialize_messages_codex_responses_function_call_output(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        messages = [
+            {"type": "function_call_output", "call_id": "c1", "output": '{"result": 42}'},
+            {"role": "user", "content": "ok"},
+        ]
+        result = mod._serialize_messages(messages)
+        assert result == [
+            {"role": "tool", "tool_call_id": "c1", "content": {"result": 42}},
+            {"role": "user", "content": "ok"},
+        ]
+
+    def test_serialize_messages_codex_responses_reasoning_skipped(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        messages = [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking..."}]},
+            {"role": "user", "content": "hello"},
+        ]
+        result = mod._serialize_messages(messages)
+        assert result == [{"role": "user", "content": "hello"}]
+
     def test_serialize_tool_calls_emits_openai_style_function_shape(self):
         sys.modules.pop("plugins.observability.langfuse", None)
         mod = importlib.import_module("plugins.observability.langfuse")

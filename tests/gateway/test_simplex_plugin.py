@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytest.importorskip("websockets")
+
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 _simplex = load_plugin_adapter("simplex")
