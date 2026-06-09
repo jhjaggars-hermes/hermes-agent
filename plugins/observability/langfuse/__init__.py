@@ -429,6 +429,33 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
+        msg_type = message.get("type")
+
+        # Responses API items (function_call, function_call_output, reasoning, etc.)
+        # carry a "type" key but no "role" key at the top level.
+        if role is None and msg_type:
+            if msg_type == "function_call":
+                serialized.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": message.get("call_id"),
+                        "name": message.get("name"),
+                        "arguments": _safe_value(message.get("arguments"), parse_json_strings=True),
+                    }],
+                })
+            elif msg_type == "function_call_output":
+                serialized.append({
+                    "role": "tool",
+                    "tool_call_id": message.get("call_id"),
+                    "content": _safe_value(message.get("output"), parse_json_strings=True),
+                })
+            # reasoning and other unrecognized Responses API types are skipped
+            continue
+
+        if role is None:
+            continue
+
         item = {
             "role": role,
             "content": _safe_value(
@@ -837,16 +864,8 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
     if output.get("tool_calls"):
         state.turn_tool_calls.extend(output["tool_calls"])
 
-    # Extract usage: prefer a real response object that carries usage, else
-    # fall back to the usage summary dict from post_api_request.
-    #
-    # post_api_request passes `response` as a SANITIZED dict (no ``.usage``
-    # attribute) alongside a separate `usage` summary dict. Gating on
-    # ``response is not None`` here took the response-object path on that dict,
-    # where ``getattr(response, "usage", None)`` is always None — so usage and
-    # cost were silently dropped for every gateway turn. Gate on a real
-    # ``.usage`` attribute instead so the usage-dict fallback below is reached.
-    if getattr(response, "usage", None) is not None:
+    # Extract usage: prefer response object, fall back to usage dict from post_api_request
+    if response is not None:
         usage_details, cost_details = _usage_and_cost(
             response,
             provider=provider,

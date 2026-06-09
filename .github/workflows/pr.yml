@@ -1,0 +1,29 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches: [homelab/main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[messaging,dev]"
+
+      - name: Compile check
+        run: python -m compileall gateway hermes_cli agent tools cron
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Role-mention tests
+        run: python -m pytest tests/gateway/test_discord_role_mentions.py -v
