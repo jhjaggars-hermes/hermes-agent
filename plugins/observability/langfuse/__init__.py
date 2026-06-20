@@ -490,6 +490,32 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
+        msg_type = message.get("type")
+
+        # Responses API items (function_call, function_call_output, reasoning, etc.)
+        # carry a "type" key but no "role" key at the top level.
+        if role is None and msg_type:
+            if msg_type == "function_call":
+                serialized.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": message.get("call_id"),
+                        "name": message.get("name"),
+                        "arguments": _safe_value(message.get("arguments"), parse_json_strings=True),
+                    }],
+                })
+            elif msg_type == "function_call_output":
+                serialized.append({
+                    "role": "tool",
+                    "tool_call_id": message.get("call_id"),
+                    "content": _safe_value(message.get("output"), parse_json_strings=True),
+                })
+            # reasoning and other unrecognized Responses API types are skipped
+            continue
+
+        if role is None:
+            continue
         item = {
             "role": role,
             "content": _safe_value(
