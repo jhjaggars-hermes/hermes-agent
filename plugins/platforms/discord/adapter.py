@@ -1050,7 +1050,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     if allow_bots == "none":
                         return
                     elif allow_bots == "mentions":
-                        if not self._client.user or self._client.user not in message.mentions:
+                        if not self._client.user or (
+                            self._client.user not in message.mentions
+                            and not self._has_accepted_role_mention(message)
+                        ):
                             return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
@@ -1083,7 +1086,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     _self_mentioned = (
                         self._client.user is not None
                         and self._client.user in message.mentions
-                    )
+                    ) or self._has_accepted_role_mention(message)
                     _other_bots_mentioned = any(
                         m.bot and m != self._client.user
                         for m in message.mentions
@@ -4335,6 +4338,39 @@ class DiscordAdapter(BasePlatformAdapter):
             and getattr(att, "waveform", None) is not None
         )
 
+    def _discord_accepted_role_ids(self) -> set:
+        """Return the set of Discord role IDs that count as a bot invocation.
+
+        Precedence: config.extra["mention_role_ids"] →
+        config.extra["accepted_mention_role_ids"] →
+        DISCORD_MENTION_ROLE_IDS → DISCORD_ACCEPTED_MENTION_ROLE_IDS.
+        Accepts YAML lists and comma-separated strings; strips whitespace;
+        ignores empty entries.
+        """
+        raw = self.config.extra.get("mention_role_ids")
+        if raw is None:
+            raw = self.config.extra.get("accepted_mention_role_ids")
+        if raw is None:
+            raw = os.getenv("DISCORD_MENTION_ROLE_IDS")
+        if raw is None:
+            raw = os.getenv("DISCORD_ACCEPTED_MENTION_ROLE_IDS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def _has_accepted_role_mention(self, message: Any) -> bool:
+        """Return True when message.role_mentions includes an accepted role ID."""
+        accepted = self._discord_accepted_role_ids()
+        if not accepted:
+            return False
+        role_mentions = getattr(message, "role_mentions", None)
+        if not role_mentions:
+            return False
+        return any(str(getattr(r, "id", "")) in accepted for r in role_mentions)
+
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs where no bot mention is required.
 
@@ -5345,6 +5381,11 @@ class DiscordAdapter(BasePlatformAdapter):
             mention_prefix = True
             normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
             normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            message.content = normalized_content
+        if self._has_accepted_role_mention(message):
+            mention_prefix = True
+            for _role_id in self._discord_accepted_role_ids():
+                normalized_content = normalized_content.replace(f"<@&{_role_id}>", "").strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}

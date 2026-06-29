@@ -1021,3 +1021,93 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+# ---------------------------------------------------------------------------
+# Responses API serialization tests
+# ---------------------------------------------------------------------------
+
+
+class TestSerializeMessagesResponsesAPI:
+    """Responses API items are serialized into Langfuse-compatible dicts."""
+
+    def test_function_call_item(self, monkeypatch):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        messages = [
+            {
+                "type": "function_call",
+                "call_id": "call_abc123",
+                "name": "get_weather",
+                "arguments": '{"city": "London"}',
+            }
+        ]
+        result = mod._serialize_messages(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "assistant"
+        assert result[0]["content"] is None
+        assert len(result[0]["tool_calls"]) == 1
+        assert result[0]["tool_calls"][0]["id"] == "call_abc123"
+        assert result[0]["tool_calls"][0]["name"] == "get_weather"
+
+    def test_function_call_output_item(self, monkeypatch):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        messages = [
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc123",
+                "output": '{"temperature": 15}',
+            }
+        ]
+        result = mod._serialize_messages(messages)
+        assert len(result) == 1
+        assert result[0]["role"] == "tool"
+        assert result[0]["tool_call_id"] == "call_abc123"
+
+    def test_reasoning_item_skipped(self, monkeypatch):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        messages = [
+            {"type": "reasoning", "content": "thinking..."}
+        ]
+        result = mod._serialize_messages(messages)
+        assert result == []
+
+    def test_regular_message_still_works(self, monkeypatch):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        result = mod._serialize_messages(messages)
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+
+    def test_mixed_regular_and_responses_api(self, monkeypatch):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        messages = [
+            {"role": "user", "content": "What's the weather?"},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city": "NYC"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": '{"temp": 72}',
+            },
+            {"role": "assistant", "content": "It's 72°F in NYC."},
+        ]
+        result = mod._serialize_messages(messages)
+        assert len(result) == 4
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+        assert result[2]["role"] == "tool"
+        assert result[3]["role"] == "assistant"
+
+    def test_no_role_no_type_skipped(self, monkeypatch):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        messages = [{"content": "no role or type"}]
+        result = mod._serialize_messages(messages)
+        assert result == []
