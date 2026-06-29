@@ -1737,6 +1737,7 @@ AUTHOR_MAP = {
     "afnlegion01@gmail.com": "Afnath-max",  # PR #49129 salvage (opencode-zen catalog refresh + uncapped/live-first picker)
     "sharma.priyanshu96@gmail.com": "ipriyaaanshu",  # PR #51488 salvage (clear stale base_url on gateway model switches; #25107)
     "jhjaggars@gmail.com": "jhjaggars",  # downstream fork maintainer
+    "hermes-agent@users.noreply.github.com": "hermes-agent",  # automated sync commits
 }
 
 
