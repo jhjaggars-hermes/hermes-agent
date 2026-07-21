@@ -19,9 +19,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # install survives the /opt/data volume overlay at runtime.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
-# Switch to bash so set -o pipefail is available for RUN blocks that use pipes.
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
 # subprocesses, git, bun, etc.) that would otherwise accumulate when hermes
@@ -35,11 +32,11 @@ RUN apt-get -o Acquire::Retries=3 update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) from the official apt repository.
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+RUN curl -fsSL -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+      https://cli.github.com/packages/githubcli-archive-keyring.gpg && \
     chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    printf '%s\n' "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
     apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
