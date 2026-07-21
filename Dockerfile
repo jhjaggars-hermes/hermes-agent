@@ -19,9 +19,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # install survives the /opt/data volume overlay at runtime.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
-# Switch to bash so set -o pipefail is available for RUN blocks that use pipes.
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 # Install system dependencies in one layer, clear APT cache.
 # tini was previously PID 1 to reap orphaned zombie processes (MCP stdio
 # subprocesses, git, bun, etc.) that would otherwise accumulate when hermes

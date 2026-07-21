@@ -7144,11 +7144,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
-        if self._has_accepted_role_mention(message):
-            mention_prefix = True
-            for role_id in self._discord_accepted_role_ids():
-                normalized_content = normalized_content.replace(f"<@&{role_id}>", "").strip()
-            message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -9385,11 +9380,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    mri = discord_cfg.get("mention_role_ids") or discord_cfg.get("accepted_mention_role_ids")
-    if mri is not None and not os.getenv("DISCORD_MENTION_ROLE_IDS"):
-        if isinstance(mri, list):
-            mri = ",".join(str(v) for v in mri)
-        os.environ["DISCORD_MENTION_ROLE_IDS"] = str(mri)
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     seeded_extra = {}
