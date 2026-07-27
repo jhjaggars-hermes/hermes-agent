@@ -2179,7 +2179,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
                 and not self._self_is_explicitly_mentioned(message)
-                and not self._has_accepted_role_mention(message)
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
@@ -7313,11 +7312,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if (
-                    not self._self_is_explicitly_mentioned(message)
-                    and not mention_prefix
-                    and not self._has_accepted_role_mention(message)
-                ):
+                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
