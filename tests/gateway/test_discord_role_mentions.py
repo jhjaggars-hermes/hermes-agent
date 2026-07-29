@@ -56,9 +56,9 @@ def _adapter(*, extra: dict | None = None) -> DiscordAdapter:
     adapter._discord_thread_require_mention = MagicMock(return_value=False)
     adapter._discord_bots_require_inline_mention = MagicMock(return_value=False)
     adapter._handle_message = AsyncMock(return_value=True)
-    adapter._threads = set()
+    setattr(adapter, "_threads", set())
     adapter._voice_text_channels = {}
-    adapter._session_id_for_channel = MagicMock(return_value="session")
+    setattr(adapter, "_session_id_for_channel", MagicMock(return_value="session"))
     return adapter
 
 
