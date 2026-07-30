@@ -1340,9 +1340,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return False, False
 
         role_authorized = False
+        accepted_role_mention = self._has_accepted_role_mention(message)
         if getattr(message.author, "bot", False):
             allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-            accepted_role_mention = self._has_accepted_role_mention(message)
             if allow_bots == "none":
                 return False, False
             if (
@@ -1377,7 +1377,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
-        raw_self_mention = self._self_is_explicitly_mentioned(message) or self._has_accepted_role_mention(message)
+        raw_self_mention = self._self_is_explicitly_mentioned(message) or accepted_role_mention
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
@@ -2218,6 +2218,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
                 and not self._self_is_explicitly_mentioned(message)
+                and not self._has_accepted_role_mention(message)
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
@@ -7483,11 +7484,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
-        if self._has_accepted_role_mention(message):
-            mention_prefix = True
-            for role_id in self._discord_accepted_role_ids():
-                normalized_content = normalized_content.replace(f"<@&{role_id}>", "").strip()
-            message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -7535,7 +7531,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if (
+                    not self._self_is_explicitly_mentioned(message)
+                    and not self._has_accepted_role_mention(message)
+                    and not mention_prefix
+                ):
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
