@@ -1340,15 +1340,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return False, False
 
         role_authorized = False
+        accepted_role_mention = self._has_accepted_role_mention(message)
         if getattr(message.author, "bot", False):
             allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
             if allow_bots == "none":
                 return False, False
-            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+            if (
+                allow_bots == "mentions"
+                and not self._self_is_explicitly_mentioned(message)
+                and not accepted_role_mention
+            ):
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
+                and not accepted_role_mention
             ):
                 return False, False
         else:
@@ -1371,7 +1377,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
-        raw_self_mention = self._self_is_explicitly_mentioned(message)
+        raw_self_mention = self._self_is_explicitly_mentioned(message) or accepted_role_mention
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
@@ -2212,6 +2218,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
                 and not self._self_is_explicitly_mentioned(message)
+                and not self._has_accepted_role_mention(message)
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
@@ -5979,6 +5986,39 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _discord_accepted_role_ids(self) -> set:
+        """Return Discord role IDs that count as an invocation mention.
+
+        Precedence: config.extra["mention_role_ids"] →
+        config.extra["accepted_mention_role_ids"] →
+        DISCORD_MENTION_ROLE_IDS → DISCORD_ACCEPTED_MENTION_ROLE_IDS.
+        Accepts YAML lists and comma-separated strings; strips whitespace and
+        ignores empty entries.
+        """
+        raw = self.config.extra.get("mention_role_ids")
+        if raw is None:
+            raw = self.config.extra.get("accepted_mention_role_ids")
+        if raw is None:
+            raw = os.getenv("DISCORD_MENTION_ROLE_IDS")
+        if raw is None:
+            raw = os.getenv("DISCORD_ACCEPTED_MENTION_ROLE_IDS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        value = str(raw).strip()
+        if value:
+            return {part.strip() for part in value.split(",") if part.strip()}
+        return set()
+
+    def _has_accepted_role_mention(self, message: Any) -> bool:
+        """Return True when ``message.role_mentions`` includes an accepted role."""
+        accepted = self._discord_accepted_role_ids()
+        if not accepted:
+            return False
+        role_mentions = getattr(message, "role_mentions", None)
+        if not role_mentions:
+            return False
+        return any(str(getattr(role, "id", "")) in accepted for role in role_mentions)
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -7491,7 +7531,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if (
+                    not self._self_is_explicitly_mentioned(message)
+                    and not self._has_accepted_role_mention(message)
+                    and not mention_prefix
+                ):
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
