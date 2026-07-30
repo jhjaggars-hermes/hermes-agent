@@ -26,10 +26,11 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
         run: |
-          # Get the merge base between this PR and its actual base branch.
-          # Homelab sync PRs target homelab/main, not origin/main; using the
-          # default branch here re-scans already-merged homelab carry commits.
-          git fetch --no-tags --prune origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          # Get the merge base against the actual PR base branch. Some fork
+          # maintenance PRs target homelab/main; hard-coding origin/main would
+          # re-scan already-merged homelab carry commits and report stale author
+          # mappings that are unrelated to the PR.
+          git fetch origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
 
           # Find any new author emails in this PR's commits
