@@ -26,10 +26,8 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
         run: |
-          # Get the merge base against the actual PR base branch. Some fork
-          # maintenance PRs target homelab/main; hard-coding origin/main would
-          # re-scan already-merged homelab carry commits and report stale author
-          # mappings that are unrelated to the PR.
+          # Get the merge base between this PR and its actual base branch.
+          # homelab sync PRs target homelab/main, not the repository default.
           git fetch origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
 
