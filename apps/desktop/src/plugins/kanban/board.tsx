@@ -78,6 +78,12 @@ import {
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
+import {
+  EMPTY_OVERRIDE,
+  ModelOverrideField,
+  overrideCreateFields,
+  type TaskModelOverride
+} from './model-override'
 import { OrchestrationPanel } from './orchestration'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
@@ -570,6 +576,7 @@ function NewTaskDialog({
   // a path here overrides just this task. Only meaningful for dir/worktree.
   const [workspacePath, setWorkspacePath] = useState('')
   const [parent, setParent] = useState('')
+  const [modelOverride, setModelOverride] = useState<TaskModelOverride>(EMPTY_OVERRIDE)
   const [goalMode, setGoalMode] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<null | string>(null)
@@ -602,6 +609,7 @@ function NewTaskDialog({
       setWorkspaceKind(boardDefaultKind)
       setWorkspacePath('')
       setParent('')
+      setModelOverride(EMPTY_OVERRIDE)
       setGoalMode(false)
       setError(null)
       setBusy(false)
@@ -637,6 +645,7 @@ function NewTaskDialog({
         title: trimmed,
         triage: isTriage,
         workspace_kind: workspaceKind,
+        ...overrideCreateFields(modelOverride),
         // Empty → backend inherits the board's default project dir.
         workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
       })
@@ -661,7 +670,15 @@ function NewTaskDialog({
 
   return (
     <Dialog onOpenChange={open => !open && onClose()} open={Boolean(target)}>
-      <DialogContent className="w-[min(42rem,94vw)] max-w-none">
+      {/* `overflow-visible`: DialogContent publishes ITSELF as the portal
+          container for popovers opened inside it (dialog-portal-context), and
+          its default `overflow-y-auto` then crops them at the dialog's edge —
+          the model menu below is born inside that scroll box. This dialog
+          already owns a scroller on its body div, so the shell's clip is
+          redundant here and dropping it is safe. The general fix to
+          DialogContent is in flight as #75600; when that lands this override
+          becomes a no-op and can go. */}
+      <DialogContent className="w-[min(42rem,94vw)] max-w-none overflow-visible">
         <DialogHeader>
           <DialogTitle>{target ? k.newTaskIn(columnLabel(k, target)) : k.newTask}</DialogTitle>
         </DialogHeader>
@@ -742,6 +759,11 @@ function NewTaskDialog({
             <Input onChange={event => setSkills(event.target.value)} placeholder={k.skillsPlaceholder} value={skills} />
           </Field>
 
+          <Field label={k.model}>
+            <ModelOverrideField onChange={setModelOverride} value={modelOverride} />
+            <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.modelHint}</span>
+          </Field>
+
           {parents.length > 0 && (
             <Field label={k.parent}>
               <Select onValueChange={v => setParent(v === NO_PARENT ? '' : v)} value={parent || NO_PARENT}>
@@ -797,7 +819,11 @@ function NewTaskDialog({
                   size="xs"
                   variant="ghost"
                 >
-                  <Codicon name={estMut.isPending ? 'loading' : 'dashboard'} size="0.75rem" spinning={estMut.isPending} />
+                  <Codicon
+                    name={estMut.isPending ? 'loading' : 'dashboard'}
+                    size="0.75rem"
+                    spinning={estMut.isPending}
+                  />
                   {estMut.isPending ? k.estimating : k.estimate}
                 </Button>
               </Tip>
@@ -1357,9 +1383,7 @@ export function KanbanBoardPage() {
         <div className="grid flex-1 place-items-center px-4 text-center">
           <div className="flex flex-col items-center gap-2">
             <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
-            <p className="text-xs text-(--ui-text-tertiary)">
-              {search || tenant || assignee ? k.noMatch : k.noTasks}
-            </p>
+            <p className="text-xs text-(--ui-text-tertiary)">{search || tenant || assignee ? k.noMatch : k.noTasks}</p>
             <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
               <Codicon name="add" size="0.75rem" />
               {k.newTask}
