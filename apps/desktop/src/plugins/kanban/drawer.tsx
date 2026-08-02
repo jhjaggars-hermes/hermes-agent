@@ -45,6 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -500,7 +501,9 @@ function EstimateSection({ id }: { id: string }) {
               ~{compactNumber(result.est_tokens)} {k.tokUnit}
             </span>
             {result.complexity && (
-              <span className="text-(--ui-text-tertiary)">· {k.complexity[result.complexity] ?? result.complexity}</span>
+              <span className="text-(--ui-text-tertiary)">
+                · {k.complexity[result.complexity] ?? result.complexity}
+              </span>
             )}
             <Tip label={k.reEstimate}>
               <Button
@@ -768,6 +771,16 @@ export function TaskDrawer({
                   {task.workspace_path}
                 </MetaRow>
               )}
+              <MetaRow label={k.model}>
+                <ModelOverrideField
+                  onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                  value={{
+                    effort: task.reasoning_effort ?? '',
+                    model: task.model_override ?? '',
+                    provider: task.provider_override ?? ''
+                  }}
+                />
+              </MetaRow>
               {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
               {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
               {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
