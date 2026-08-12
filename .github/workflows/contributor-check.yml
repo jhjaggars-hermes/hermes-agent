@@ -24,11 +24,18 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Get the merge base against the PR's actual base branch. Do not
+          # hard-code origin/main: homelab sync PRs target homelab/main, and
+          # checking against origin/main re-scans already-merged homelab carry
+          # commits as if they were new.
+          BASE_REF="${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}"
+          git fetch --no-tags origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Find any new author emails on this PR's first-parent chain. Sync
+          # PRs may merge upstream/main as a second parent; walking all parents
+          # would re-scan upstream's already-vetted authors.
+          NEW_EMAILS=$(git log --first-parent ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
