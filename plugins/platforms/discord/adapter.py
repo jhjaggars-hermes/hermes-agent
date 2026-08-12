@@ -23,16 +23,38 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
 )
+from agent.display import ToolPreview
 
 logger = logging.getLogger(__name__)
+
+_DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
+_DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _format_discord_markdown_link(label: str, url: str) -> str:
+    """Return a Discord Markdown link whose label is not itself a URL.
+
+    Discord gives URL-shaped link labels their own link behavior. A truncated
+    URL label can therefore win over the Markdown destination and remain a
+    broken link. Dropping only the scheme keeps the preview recognizable while
+    leaving one unambiguous click target.
+
+    The destination is wrapped in angle brackets (``<url>``) so Discord does
+    not unfurl an OG-preview embed under every tool progress bubble.
+    """
+    label = _DISCORD_URL_LABEL_SCHEME_RE.sub("", label, count=1)
+    escaped_label = _DISCORD_MARKDOWN_LINK_LABEL_RE.sub(r"\\\1", label)
+    escaped_url = quote(url, safe=":/?#[]@!$&'*+,;=%")
+    return f"[{escaped_label}](<{escaped_url}>)"
 
 
 class _Snowflake:
@@ -97,7 +119,6 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
-
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -121,7 +142,11 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 
-from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets
+from gateway.platforms.helpers import (
+    MessageDeduplicator,
+    ThreadParticipationTracker,
+    convert_table_to_bullets,
+)
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -365,6 +390,8 @@ _GATE_ENV_KEYS = (
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
+    "DISCORD_MENTION_ROLE_IDS",
+    "DISCORD_ACCEPTED_MENTION_ROLE_IDS",
     "GATEWAY_ALLOW_ALL_USERS",
     "GATEWAY_ALLOWED_USERS",
 )
@@ -405,6 +432,17 @@ def _profile_scoped_config_load() -> bool:
         return bool(is_multiplex_active() and current_secret_scope() is not None)
     except Exception:
         return False
+
+
+def discord_deps_present() -> bool:
+    """PASSIVE probe: is discord.py importable right now?
+
+    Registry ``check_fn`` — called from status displays and config loading,
+    so it must never install anything.  The ACTIVE lazy-installer
+    (``check_discord_requirements``) is registered as ``ensure_deps_fn``
+    and runs from ``create_adapter()`` when this returns False (#79812).
+    """
+    return DISCORD_AVAILABLE
 
 
 def check_discord_requirements() -> bool:
@@ -977,6 +1015,13 @@ class DiscordAdapter(BasePlatformAdapter):
     PLAYBACK_TIMEOUT = 120
     PLAYBACK_TIMEOUT_PADDING = 30
 
+    def format_tool_preview(self, preview: ToolPreview) -> str:
+        """Keep a truncated URL preview clickable in Discord markdown."""
+        if not preview.url:
+            return preview.text
+
+        return _format_discord_markdown_link(preview.text, preview.url)
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
@@ -1405,21 +1450,18 @@ class DiscordAdapter(BasePlatformAdapter):
             return False, False
 
         role_authorized = False
-        accepted_role_mention = self._has_accepted_role_mention(message)
         if getattr(message.author, "bot", False):
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
-            if (
-                allow_bots == "mentions"
-                and not self._self_is_explicitly_mentioned(message)
-                and not accepted_role_mention
+            if allow_bots == "mentions" and not (
+                self._self_is_explicitly_mentioned(message)
+                or self._has_accepted_role_mention(message)
             ):
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
-                and not accepted_role_mention
             ):
                 return False, False
         else:
@@ -1442,7 +1484,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
-        raw_self_mention = self._self_is_explicitly_mentioned(message) or accepted_role_mention
+        raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
@@ -1748,6 +1790,19 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        # Clean up all active voice connections *before* cancelling the bot task.
+        # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
+        # VoiceClient.disconnect() sends a voice state update over the main
+        # gateway websocket and then waits for the voice socket to close.  The
+        # bot task is the loop running that gateway connection, so cancelling it
+        # first leaves the handshake with no transport: it can never complete and
+        # blocks until the caller's shutdown timeout fires.
+        for guild_id in list(self._voice_clients.keys()):
+            try:
+                await self.leave_voice_channel(guild_id)
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
+
         # Cancel the bot task before closing the client.  If connect() timed out
         # and returned False, the background client.start() task may still be
         # running; calling client.close() alone is not enough to stop it because
@@ -1755,12 +1810,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # WebSocket handshake is in flight.  Explicitly cancelling the task here
         # ensures the zombie client cannot receive or dispatch any further events.
         await self._cancel_bot_task()
-        # Clean up all active voice connections before closing the client
-        for guild_id in list(self._voice_clients.keys()):
-            try:
-                await self.leave_voice_channel(guild_id)
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.debug("[%s] Error leaving voice channel %s: %s", self.name, guild_id, e)
 
         if self._client:
             try:
@@ -3009,6 +3058,29 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        if not (content or "").strip():
+            logger.warning(
+                "[%s] Dropped empty message to chat=%s (caller bug). Call site:\n%s",
+                self.name,
+                chat_id,
+                "".join(traceback.format_stack(limit=12)[:-1]),
+            )
+            result = SendResult(
+                success=False,
+                error="Refusing to send empty message",
+            )
+            # Mirror the exception path's recovery bookkeeping. Missed-message
+            # backfill decides what to replay from this table, so a dropped
+            # final reply must be recorded as failed — otherwise the reply is
+            # both never sent and never retried.
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=reply_to,
+                result=result,
+                content=content,
+                final=bool(metadata and metadata.get("notify")),
+            )
+            return result
 
         try:
             # Determine target channel: thread_id in metadata takes precedence.
@@ -6084,39 +6156,6 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
-    def _discord_accepted_role_ids(self) -> set:
-        """Return Discord role IDs that count as an invocation mention.
-
-        Precedence: config.extra["mention_role_ids"] →
-        config.extra["accepted_mention_role_ids"] →
-        DISCORD_MENTION_ROLE_IDS → DISCORD_ACCEPTED_MENTION_ROLE_IDS.
-        Accepts YAML lists and comma-separated strings; strips whitespace and
-        ignores empty entries.
-        """
-        raw = self.config.extra.get("mention_role_ids")
-        if raw is None:
-            raw = self.config.extra.get("accepted_mention_role_ids")
-        if raw is None:
-            raw = os.getenv("DISCORD_MENTION_ROLE_IDS")
-        if raw is None:
-            raw = os.getenv("DISCORD_ACCEPTED_MENTION_ROLE_IDS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        value = str(raw).strip()
-        if value:
-            return {part.strip() for part in value.split(",") if part.strip()}
-        return set()
-
-    def _has_accepted_role_mention(self, message: Any) -> bool:
-        """Return True when ``message.role_mentions`` includes an accepted role."""
-        accepted = self._discord_accepted_role_ids()
-        if not accepted:
-            return False
-        role_mentions = getattr(message, "role_mentions", None)
-        if not role_mentions:
-            return False
-        return any(str(getattr(role, "id", "")) in accepted for role in role_mentions)
-
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -6287,6 +6326,52 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _discord_accepted_role_ids(self) -> set:
+        """Return Discord role IDs that count as an invocation mention.
+
+        Precedence: config.extra["mention_role_ids"] →
+        config.extra["accepted_mention_role_ids"] →
+        DISCORD_MENTION_ROLE_IDS → DISCORD_ACCEPTED_MENTION_ROLE_IDS.
+        Accepts YAML lists and comma-separated strings; strips whitespace and
+        ignores empty entries.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        raw = None
+        if isinstance(extra, dict):
+            raw = extra.get("mention_role_ids")
+            if raw is None:
+                raw = extra.get("accepted_mention_role_ids")
+
+        def _role_env(name: str):
+            snap = getattr(self, "_gate_env_snapshot", None)
+            if snap is not None and name in snap:
+                return snap[name]
+            if name in os.environ:
+                return os.environ.get(name, "")
+            scoped = _scoped_gate_env(name, "")
+            return scoped if scoped else None
+
+        if raw is None:
+            raw = _role_env("DISCORD_MENTION_ROLE_IDS")
+        if raw is None:
+            raw = _role_env("DISCORD_ACCEPTED_MENTION_ROLE_IDS") or ""
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        value = str(raw).strip()
+        if value:
+            return {part.strip() for part in value.split(",") if part.strip()}
+        return set()
+
+    def _has_accepted_role_mention(self, message: Any) -> bool:
+        """Return True when ``message.role_mentions`` includes an accepted role."""
+        accepted = self._discord_accepted_role_ids()
+        if not accepted:
+            return False
+        role_mentions = getattr(message, "role_mentions", None)
+        if not role_mentions:
+            return False
+        return any(str(getattr(role, "id", "")) in accepted for role in role_mentions)
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
@@ -7720,11 +7805,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if (
-                    not self._self_is_explicitly_mentioned(message)
-                    and not self._has_accepted_role_mention(message)
-                    and not mention_prefix
-                ):
+                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
@@ -9776,7 +9857,10 @@ async def _standalone_send(
             result["warnings"] = warnings
         return result
     except Exception as e:
-        return {"error": _standalone_sanitize_error(f"Discord send failed: {e}")}
+        # Include the exception type: TimeoutError().str() is empty, so
+        # "Discord send failed: " alone gave no diagnostic signal.
+        logger.error("Discord standalone send failed", exc_info=True)
+        return {"error": _standalone_sanitize_error(f"Discord send failed: {type(e).__name__}: {e}")}
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
@@ -10088,7 +10172,8 @@ def register(ctx) -> None:
         name="discord",
         label="Discord",
         adapter_factory=_build_adapter,
-        check_fn=check_discord_requirements,
+        check_fn=discord_deps_present,
+        ensure_deps_fn=check_discord_requirements,
         is_connected=_is_connected,
         required_env=["DISCORD_BOT_TOKEN"],
         install_hint="Run `hermes setup` to install Discord support.",
