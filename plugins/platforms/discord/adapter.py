@@ -1454,14 +1454,14 @@ class DiscordAdapter(BasePlatformAdapter):
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
+            role_mentioned = self._has_accepted_role_mention(message)
             if allow_bots == "mentions" and not (
-                self._self_is_explicitly_mentioned(message)
-                or self._has_accepted_role_mention(message)
+                self._self_is_explicitly_mentioned(message) or role_mentioned
             ):
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
-                and not self._self_is_raw_mentioned(message)
+                and not (self._self_is_raw_mentioned(message) or role_mentioned)
             ):
                 return False, False
         else:
@@ -1484,7 +1484,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
-        raw_self_mention = self._self_is_explicitly_mentioned(message)
+        raw_self_mention = (
+            self._self_is_explicitly_mentioned(message)
+            or self._has_accepted_role_mention(message)
+        )
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
@@ -6156,6 +6159,47 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _discord_accepted_role_ids(self) -> set:
+        """Return role IDs that count as an explicit Discord bot invocation.
+
+        Precedence: ``mention_role_ids`` -> ``accepted_mention_role_ids`` ->
+        ``DISCORD_MENTION_ROLE_IDS`` -> ``DISCORD_ACCEPTED_MENTION_ROLE_IDS``.
+        Values may be YAML lists or comma-separated strings.  Unlike the
+        authorization allow/deny gates, the adapter config keys intentionally
+        win over process env here so a homelab profile can opt into role-mention
+        invocation without inheriting another profile's env fallback.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        if isinstance(extra, dict):
+            if "mention_role_ids" in extra:
+                return self._gate_csv_set(extra.get("mention_role_ids"))
+            if "accepted_mention_role_ids" in extra:
+                return self._gate_csv_set(extra.get("accepted_mention_role_ids"))
+
+        # Empty primary env is configured-empty and blocks alias fallback,
+        # matching the existing Discord list-parsing convention.
+        snap = getattr(self, "_gate_env_snapshot", None)
+        if snap is not None and "DISCORD_MENTION_ROLE_IDS" in snap:
+            return self._gate_csv_set(snap.get("DISCORD_MENTION_ROLE_IDS"))
+        env_primary = os.environ.get("DISCORD_MENTION_ROLE_IDS")
+        if env_primary is not None:
+            return self._gate_csv_set(env_primary)
+
+        snap = getattr(self, "_gate_env_snapshot", None)
+        if snap is not None and "DISCORD_ACCEPTED_MENTION_ROLE_IDS" in snap:
+            return self._gate_csv_set(snap.get("DISCORD_ACCEPTED_MENTION_ROLE_IDS"))
+        return self._gate_csv_set(os.environ.get("DISCORD_ACCEPTED_MENTION_ROLE_IDS"))
+
+    def _has_accepted_role_mention(self, message: Any) -> bool:
+        """Return True when ``message.role_mentions`` includes an accepted role."""
+        accepted = self._discord_accepted_role_ids()
+        if not accepted:
+            return False
+        role_mentions = getattr(message, "role_mentions", None)
+        if not role_mentions:
+            return False
+        return any(str(getattr(role, "id", "")) in accepted for role in role_mentions)
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -6326,52 +6370,6 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
-
-    def _discord_accepted_role_ids(self) -> set:
-        """Return Discord role IDs that count as an invocation mention.
-
-        Precedence: config.extra["mention_role_ids"] →
-        config.extra["accepted_mention_role_ids"] →
-        DISCORD_MENTION_ROLE_IDS → DISCORD_ACCEPTED_MENTION_ROLE_IDS.
-        Accepts YAML lists and comma-separated strings; strips whitespace and
-        ignores empty entries.
-        """
-        extra = getattr(getattr(self, "config", None), "extra", None)
-        raw = None
-        if isinstance(extra, dict):
-            raw = extra.get("mention_role_ids")
-            if raw is None:
-                raw = extra.get("accepted_mention_role_ids")
-
-        def _role_env(name: str):
-            snap = getattr(self, "_gate_env_snapshot", None)
-            if snap is not None and name in snap:
-                return snap[name]
-            if name in os.environ:
-                return os.environ.get(name, "")
-            scoped = _scoped_gate_env(name, "")
-            return scoped if scoped else None
-
-        if raw is None:
-            raw = _role_env("DISCORD_MENTION_ROLE_IDS")
-        if raw is None:
-            raw = _role_env("DISCORD_ACCEPTED_MENTION_ROLE_IDS") or ""
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        value = str(raw).strip()
-        if value:
-            return {part.strip() for part in value.split(",") if part.strip()}
-        return set()
-
-    def _has_accepted_role_mention(self, message: Any) -> bool:
-        """Return True when ``message.role_mentions`` includes an accepted role."""
-        accepted = self._discord_accepted_role_ids()
-        if not accepted:
-            return False
-        role_mentions = getattr(message, "role_mentions", None)
-        if not role_mentions:
-            return False
-        return any(str(getattr(role, "id", "")) in accepted for role in role_mentions)
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
@@ -7760,6 +7758,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        if self._has_accepted_role_mention(message):
+            mention_prefix = True
+            for role_id in self._discord_accepted_role_ids():
+                normalized_content = normalized_content.replace(f"<@&{role_id}>", "").strip()
+            message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -7805,7 +7808,11 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if (
+                    not self._self_is_explicitly_mentioned(message)
+                    and not self._has_accepted_role_mention(message)
+                    and not mention_prefix
+                ):
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
@@ -10027,6 +10034,19 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allowed_roles"] = str(allowed_roles_cfg)
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_ROLES"):
             os.environ["DISCORD_ALLOWED_ROLES"] = str(allowed_roles_cfg)
+    mention_roles_cfg = (
+        discord_cfg["mention_role_ids"] if "mention_role_ids" in discord_cfg
+        else discord_cfg["accepted_mention_role_ids"] if "accepted_mention_role_ids" in discord_cfg
+        else platform_extra_cfg.get("mention_role_ids")
+        if "mention_role_ids" in platform_extra_cfg
+        else platform_extra_cfg.get("accepted_mention_role_ids")
+    )
+    if mention_roles_cfg is not None:
+        if isinstance(mention_roles_cfg, list):
+            mention_roles_cfg = ",".join(str(v) for v in mention_roles_cfg)
+        seeded_extra["mention_role_ids"] = str(mention_roles_cfg)
+        if not _skip_env_bridge and not os.getenv("DISCORD_MENTION_ROLE_IDS"):
+            os.environ["DISCORD_MENTION_ROLE_IDS"] = str(mention_roles_cfg)
     allow_all_cfg = (
         discord_cfg["allow_all_users"] if "allow_all_users" in discord_cfg
         else platform_extra_cfg.get("allow_all_users")
