@@ -266,6 +266,46 @@ async def _wait_for_ready_or_bot_exit(
                 await ready_task
 
 
+def _needs_server_members_intent(
+    allowed_user_ids: set[str] | list[str] | None,
+    allowed_role_ids: set[str] | list[str] | None,
+) -> bool:
+    """Return True when Hermes must request Discord's Server Members intent.
+
+    Message Content is always requested. Server Members is only needed when the
+    allowlist contains usernames (not pure numeric IDs / ``*``) or when role
+    allowlists require member role lookups.
+    """
+    entries = allowed_user_ids or ()
+    if any(entry != "*" and not str(entry).isdigit() for entry in entries):
+        return True
+    return bool(allowed_role_ids)
+
+
+def _format_privileged_intents_guidance(*, needs_members: bool) -> str:
+    """Actionable fix text when Discord rejects privileged Gateway Intents."""
+    lines = [
+        "Discord rejected the connection because privileged Gateway Intents "
+        "are not enabled for this bot in the Developer Portal.",
+        "Hermes is requesting:",
+        "  - Message Content Intent (required to read message text)",
+    ]
+    if needs_members:
+        lines.append(
+            "  - Server Members Intent (required for username allowlists "
+            "and/or DISCORD_ALLOWED_ROLES)"
+        )
+    lines.extend(
+        [
+            "Fix: https://discord.com/developers/applications → your application "
+            "→ Bot → Privileged Gateway Intents → enable the intent(s) listed "
+            "above → Save Changes, then restart the gateway.",
+            "Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/discord",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
     """Return discord.py's bundled Windows opus DLL path when present."""
     if sys.platform != "win32":
@@ -1288,18 +1328,16 @@ class DiscordAdapter(BasePlatformAdapter):
             # that aren't enabled in the Discord Developer Portal can prevent the
             # bot from coming online at all, so avoid requesting members intent
             # unless it is actually necessary.
+            # ``"*"`` is the open-mode wildcard (honored in _is_allowed_user), not
+            # a username to resolve — requesting Members for it would silently
+            # fail bots that never enabled Members Intent in the Developer Portal.
             intents = Intents.default()
             intents.message_content = True
             intents.dm_messages = True
             intents.guild_messages = True
-            intents.members = (
-                # ``"*"`` is the open-mode wildcard (honored in _is_allowed_user),
-                # not a username to resolve, so it must not pull in the privileged
-                # Server Members intent — exactly the migrate-from-OpenClaw path
-                # the wildcard fix targets would otherwise silently fail to come
-                # online when Members Intent isn't enabled in the Developer Portal.
-                any(entry != "*" and not entry.isdigit() for entry in self._allowed_user_ids)
-                or bool(self._allowed_role_ids)  # Need members intent for role lookup
+            intents.members = _needs_server_members_intent(
+                self._allowed_user_ids,
+                self._allowed_role_ids,
             )
             intents.voice_states = True
 
@@ -1357,6 +1395,22 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
+
+            @self._client.event
+            async def on_message_edit(before: DiscordMessage, after: DiscordMessage):
+                await adapter_self._on_platform_message_edit(before, after)
+
+            @self._client.event
+            async def on_message_delete(message: DiscordMessage):
+                await adapter_self._on_platform_message_delete(message)
+
+            @self._client.event
+            async def on_thread_create(thread):
+                await adapter_self._on_platform_thread_create(thread)
+
+            @self._client.event
+            async def on_thread_update(before, after):
+                await adapter_self._on_platform_thread_update(before, after)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -1421,6 +1475,13 @@ class DiscordAdapter(BasePlatformAdapter):
             # each process every message, producing duplicate threads/responses.
             await self._cancel_bot_task()
             self._release_platform_lock()
+            # Always set an explicit fatal code (OOF-152): a code-less failure
+            # forces the gateway into its "no info = probably transient" guess.
+            self._set_fatal_error(
+                "discord_connect_timeout",
+                "Timed out waiting for the Discord gateway to become ready",
+                retryable=True,
+            )
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
@@ -1429,7 +1490,58 @@ class DiscordAdapter(BasePlatformAdapter):
             # step raises. Cancel it so the discarded adapter cannot connect.
             await self._cancel_bot_task()
             self._release_platform_lock()
+            # Classify by exception TYPE (OOF-152). Previously this branch set
+            # no fatal error at all, so the gateway treated every startup
+            # failure — including a revoked token or a privileged intent that
+            # was never enabled in the Developer Portal — as transient and
+            # retried it forever with zero owner signal. Auth/permission
+            # failures can never self-heal: mark them retryable=False so they
+            # drop out of the reconnect queue and surface as fatal.
+            code, message, retryable = self._classify_connect_exception(e)
+            self._set_fatal_error(code, message, retryable=retryable)
             return False
+
+    def _classify_connect_exception(self, error: Exception) -> tuple:
+        """Map a Discord startup exception to ``(code, message, retryable)``.
+
+        Type-based only — never match on message text. Unknown exception
+        types stay ``retryable=True``: a false terminal on a transient error
+        would leave a recovered platform silently dead, which is the exact
+        failure mode the auto-pause removal fixed. The reconnect watcher's
+        NEEDS_ATTENTION escalation covers misclassified permanent failures.
+        """
+        def _is(type_name: str) -> bool:
+            # Class-name check covers mocked discord.py (tests) and failed
+            # imports; the isinstance check additionally covers subclasses.
+            if error.__class__.__name__ == type_name:
+                return True
+            try:
+                import discord as _discord
+                exc_type = getattr(_discord, type_name, None)
+                return isinstance(exc_type, type) and isinstance(error, exc_type)
+            except Exception:
+                return False
+
+        if _is("LoginFailure"):
+            return (
+                "discord_auth_error",
+                f"Discord bot token rejected: {error}. The token is invalid or "
+                "was revoked — regenerate it in the Discord Developer Portal "
+                "and update DISCORD_BOT_TOKEN.",
+                False,
+            )
+        if _is("PrivilegedIntentsRequired"):
+            # Name the exact intents Hermes requested (#79430): Message
+            # Content always; Server Members only when username/role
+            # allowlists actually need member lookups.
+            guidance = _format_privileged_intents_guidance(
+                needs_members=_needs_server_members_intent(
+                    getattr(self, "_allowed_user_ids", None),
+                    getattr(self, "_allowed_role_ids", None),
+                )
+            )
+            return ("discord_intents_required", guidance, False)
+        return ("discord_connect_error", f"Discord startup failed: {error}", True)
 
     def _discord_message_admission(
         self,
@@ -1454,14 +1566,11 @@ class DiscordAdapter(BasePlatformAdapter):
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
-            role_mentioned = self._has_accepted_role_mention(message)
-            if allow_bots == "mentions" and not (
-                self._self_is_explicitly_mentioned(message) or role_mentioned
-            ):
+            if allow_bots == "mentions" and not self._message_has_invocation_mention(message):
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
-                and not (self._self_is_raw_mentioned(message) or role_mentioned)
+                and not self._self_is_raw_mentioned(message)
             ):
                 return False, False
         else:
@@ -1484,10 +1593,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
-        raw_self_mention = (
-            self._self_is_explicitly_mentioned(message)
-            or self._has_accepted_role_mention(message)
-        )
+        raw_self_mention = self._message_has_invocation_mention(message)
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
@@ -1526,6 +1632,256 @@ class DiscordAdapter(BasePlatformAdapter):
         return await self._handle_message(
             message, role_authorized=role_authorized,
         )
+
+    # ------------------------------------------------------------------
+    # gateway_platform_event fire-sites (#64176)
+    # ------------------------------------------------------------------
+
+    def _thread_id_and_chat_for_channel(self, channel) -> tuple[Optional[str], Optional[str]]:
+        """Return ``(thread_id, chat_id)`` for a message channel.
+
+        For a thread, ``chat_id`` is the thread id itself (matching how
+        Discord message dispatch keys sessions) and ``thread_id`` is set;
+        for a plain channel, ``thread_id`` is None.
+        """
+        if channel is None:
+            return None, None
+        chan_id = getattr(channel, "id", None)
+        if chan_id is None:
+            return None, None
+        is_thread = isinstance(channel, getattr(discord, "Thread", ()))
+        return (str(chan_id) if is_thread else None), str(chan_id)
+
+    def _source_for_platform_event(
+        self,
+        *,
+        chat_id: str,
+        user_id: Optional[str],
+        user_name: Optional[str],
+        thread_id: Optional[str],
+        guild_id: Optional[str],
+        message_id: Optional[str] = None,
+    ):
+        """Build the internal SessionSource the gateway authorizes against.
+
+        Raises ``ValueError`` when the actor or chat identity is missing so the
+        post-auth boundary fails closed instead of authorizing an incomplete
+        source (mirrors the Telegram reaction extractor).
+        """
+        if not user_id or not chat_id:
+            raise ValueError(
+                "gateway_platform_event requires actor and chat identities"
+            )
+        return self.build_source(
+            chat_id=chat_id,
+            chat_type="thread" if thread_id else "group",
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=thread_id,
+            guild_id=guild_id,
+            message_id=message_id,
+        )
+
+    async def _fire_platform_event(self, event: Dict[str, Any], source) -> None:
+        """Forward one normalized envelope to the gateway-owned boundary.
+
+        No installed callback means no trusted auth boundary — fail closed.
+        Dispatch errors never propagate into discord.py's event loop.
+        """
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None:
+            return
+        try:
+            await handler(event, source)
+        except Exception:
+            logger.debug(
+                "[%s] gateway_platform_event dispatch error", self.name, exc_info=True,
+            )
+
+    @staticmethod
+    def _platform_events_subscribed() -> bool:
+        """has_hook fast-path shared by every Discord fire-site."""
+        try:
+            from hermes_cli.lifecycle import has_hook
+
+            return has_hook("gateway_platform_event")
+        except Exception:
+            return False
+
+    async def _on_platform_message_edit(self, before, after) -> None:
+        """Normalize ``on_message_edit`` into event_type ``message_edited``."""
+        if not self._platform_events_subscribed():
+            return
+        try:
+            message = after if after is not None else before
+            author = getattr(message, "author", None)
+            if author is not None and getattr(author, "bot", False):
+                return  # bot's own progressive edits are noise, not user events
+            thread_id, chat_id = self._thread_id_and_chat_for_channel(
+                getattr(message, "channel", None)
+            )
+            message_id = getattr(message, "id", None)
+            if chat_id is None or message_id is None:
+                return
+            text = getattr(message, "content", None)
+            edited_at = getattr(message, "edited_at", None)
+            guild = getattr(message, "guild", None)
+            event = {
+                "platform": "discord",
+                "event_type": "message_edited",
+                "payload": {
+                    "chat_id": str(chat_id)[:128],
+                    "message_id": str(message_id)[:128],
+                    "thread_id": thread_id[:128] if thread_id else None,
+                    "text": text[:8192] if isinstance(text, str) else None,
+                    "edited_at": (
+                        str(edited_at.isoformat())[:64]
+                        if edited_at is not None and hasattr(edited_at, "isoformat")
+                        else None
+                    ),
+                },
+            }
+            source = self._source_for_platform_event(
+                chat_id=str(chat_id),
+                user_id=str(getattr(author, "id", "") or "") or None,
+                user_name=getattr(author, "display_name", None),
+                thread_id=thread_id,
+                guild_id=str(getattr(guild, "id", "")) if guild else None,
+                message_id=str(message_id),
+            )
+        except Exception:
+            logger.debug(
+                "[%s] message_edited normalize error", self.name, exc_info=True,
+            )
+            return
+        await self._fire_platform_event(event, source)
+
+    async def _on_platform_message_delete(self, message) -> None:
+        """Normalize ``on_message_delete`` into event_type ``message_deleted``.
+
+        Discord does not identify the deleter in this event; the source
+        authorized is the deleted message's author (the only identity the
+        cached event carries). Uncached deletions never fire.
+        """
+        if not self._platform_events_subscribed():
+            return
+        try:
+            author = getattr(message, "author", None)
+            if author is not None and getattr(author, "bot", False):
+                return
+            thread_id, chat_id = self._thread_id_and_chat_for_channel(
+                getattr(message, "channel", None)
+            )
+            message_id = getattr(message, "id", None)
+            if chat_id is None or message_id is None:
+                return
+            guild = getattr(message, "guild", None)
+            event = {
+                "platform": "discord",
+                "event_type": "message_deleted",
+                "payload": {
+                    "chat_id": str(chat_id)[:128],
+                    "message_id": str(message_id)[:128],
+                    "thread_id": thread_id[:128] if thread_id else None,
+                    "author_id": str(getattr(author, "id", "") or "")[:128] or None,
+                },
+            }
+            source = self._source_for_platform_event(
+                chat_id=str(chat_id),
+                user_id=str(getattr(author, "id", "") or "") or None,
+                user_name=getattr(author, "display_name", None),
+                thread_id=thread_id,
+                guild_id=str(getattr(guild, "id", "")) if guild else None,
+                message_id=str(message_id),
+            )
+        except Exception:
+            logger.debug(
+                "[%s] message_deleted normalize error", self.name, exc_info=True,
+            )
+            return
+        await self._fire_platform_event(event, source)
+
+    async def _on_platform_thread_create(self, thread) -> None:
+        """Normalize ``on_thread_create`` into event_type ``thread_created``."""
+        if not self._platform_events_subscribed():
+            return
+        try:
+            thread_id = getattr(thread, "id", None)
+            owner_id = getattr(thread, "owner_id", None)
+            if thread_id is None:
+                return
+            parent_id = getattr(thread, "parent_id", None)
+            guild = getattr(thread, "guild", None)
+            name = getattr(thread, "name", None)
+            event = {
+                "platform": "discord",
+                "event_type": "thread_created",
+                "payload": {
+                    "thread_id": str(thread_id)[:128],
+                    "parent_chat_id": str(parent_id)[:128] if parent_id is not None else None,
+                    "name": name[:256] if isinstance(name, str) else None,
+                    "owner_id": str(owner_id)[:128] if owner_id is not None else None,
+                },
+            }
+            source = self._source_for_platform_event(
+                chat_id=str(thread_id),
+                user_id=str(owner_id) if owner_id is not None else None,
+                user_name=None,
+                thread_id=str(thread_id),
+                guild_id=str(getattr(guild, "id", "")) if guild else None,
+            )
+        except Exception:
+            logger.debug(
+                "[%s] thread_created normalize error", self.name, exc_info=True,
+            )
+            return
+        await self._fire_platform_event(event, source)
+
+    async def _on_platform_thread_update(self, before, after) -> None:
+        """Normalize a rename observed via ``on_thread_update`` into
+        event_type ``thread_renamed``. Non-rename updates (archive state,
+        slowmode, tags) are dropped.
+
+        Discord's thread-update event carries no actor; the thread owner is
+        the only stable identity available, so that is what the gateway
+        authorizes (same trade-off as ``message_deleted``'s author).
+        """
+        if not self._platform_events_subscribed():
+            return
+        try:
+            old_name = getattr(before, "name", None)
+            new_name = getattr(after, "name", None)
+            if old_name == new_name or not isinstance(new_name, str):
+                return
+            thread_id = getattr(after, "id", None)
+            owner_id = getattr(after, "owner_id", None)
+            if thread_id is None:
+                return
+            parent_id = getattr(after, "parent_id", None)
+            guild = getattr(after, "guild", None)
+            event = {
+                "platform": "discord",
+                "event_type": "thread_renamed",
+                "payload": {
+                    "thread_id": str(thread_id)[:128],
+                    "parent_chat_id": str(parent_id)[:128] if parent_id is not None else None,
+                    "old_name": old_name[:256] if isinstance(old_name, str) else None,
+                    "new_name": new_name[:256],
+                },
+            }
+            source = self._source_for_platform_event(
+                chat_id=str(thread_id),
+                user_id=str(owner_id) if owner_id is not None else None,
+                user_name=None,
+                thread_id=str(thread_id),
+                guild_id=str(getattr(guild, "id", "")) if guild else None,
+            )
+        except Exception:
+            logger.debug(
+                "[%s] thread_renamed normalize error", self.name, exc_info=True,
+            )
+            return
+        await self._fire_platform_event(event, source)
 
     async def _cancel_bot_task(self) -> None:
         """Cancel and await the background client.start() task, if running."""
@@ -2330,8 +2686,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
-                and not self._self_is_explicitly_mentioned(message)
-                and not self._has_accepted_role_mention(message)
+                and not self._message_has_invocation_mention(message)
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
@@ -6159,47 +6514,6 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
-    def _discord_accepted_role_ids(self) -> set:
-        """Return role IDs that count as an explicit Discord bot invocation.
-
-        Precedence: ``mention_role_ids`` -> ``accepted_mention_role_ids`` ->
-        ``DISCORD_MENTION_ROLE_IDS`` -> ``DISCORD_ACCEPTED_MENTION_ROLE_IDS``.
-        Values may be YAML lists or comma-separated strings.  Unlike the
-        authorization allow/deny gates, the adapter config keys intentionally
-        win over process env here so a homelab profile can opt into role-mention
-        invocation without inheriting another profile's env fallback.
-        """
-        extra = getattr(getattr(self, "config", None), "extra", None)
-        if isinstance(extra, dict):
-            if "mention_role_ids" in extra:
-                return self._gate_csv_set(extra.get("mention_role_ids"))
-            if "accepted_mention_role_ids" in extra:
-                return self._gate_csv_set(extra.get("accepted_mention_role_ids"))
-
-        # Empty primary env is configured-empty and blocks alias fallback,
-        # matching the existing Discord list-parsing convention.
-        snap = getattr(self, "_gate_env_snapshot", None)
-        if snap is not None and "DISCORD_MENTION_ROLE_IDS" in snap:
-            return self._gate_csv_set(snap.get("DISCORD_MENTION_ROLE_IDS"))
-        env_primary = os.environ.get("DISCORD_MENTION_ROLE_IDS")
-        if env_primary is not None:
-            return self._gate_csv_set(env_primary)
-
-        snap = getattr(self, "_gate_env_snapshot", None)
-        if snap is not None and "DISCORD_ACCEPTED_MENTION_ROLE_IDS" in snap:
-            return self._gate_csv_set(snap.get("DISCORD_ACCEPTED_MENTION_ROLE_IDS"))
-        return self._gate_csv_set(os.environ.get("DISCORD_ACCEPTED_MENTION_ROLE_IDS"))
-
-    def _has_accepted_role_mention(self, message: Any) -> bool:
-        """Return True when ``message.role_mentions`` includes an accepted role."""
-        accepted = self._discord_accepted_role_ids()
-        if not accepted:
-            return False
-        role_mentions = getattr(message, "role_mentions", None)
-        if not role_mentions:
-            return False
-        return any(str(getattr(role, "id", "")) in accepted for role in role_mentions)
-
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -6432,6 +6746,54 @@ class DiscordAdapter(BasePlatformAdapter):
             "yes",
             "on",
         }
+
+
+    def _discord_accepted_role_ids(self) -> set[str]:
+        """Return Discord role IDs accepted as invocation mentions.
+
+        Config keys (preferred): ``discord.mention_role_ids`` or the older
+        ``discord.accepted_mention_role_ids``. Env fallbacks are
+        ``DISCORD_MENTION_ROLE_IDS`` and ``DISCORD_ACCEPTED_MENTION_ROLE_IDS``.
+        These roles only satisfy the mention/invocation gate; they do not
+        grant user authorization, which remains governed by
+        ``DISCORD_ALLOWED_USERS`` / ``DISCORD_ALLOWED_ROLES``.
+        """
+
+        raw = self.config.extra.get("mention_role_ids")
+        if raw is None:
+            raw = self.config.extra.get("accepted_mention_role_ids")
+        if raw is None:
+            primary = self._gate_env("DISCORD_MENTION_ROLE_IDS")
+            raw = primary if primary != "" else self._gate_env("DISCORD_ACCEPTED_MENTION_ROLE_IDS")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        text = str(raw or "").strip()
+        if not text:
+            return set()
+        return {part.strip() for part in text.split(",") if part.strip()}
+
+    def _has_accepted_role_mention(self, message: Any) -> bool:
+        """Return True when a message mentions a configured invocation role."""
+
+        accepted = self._discord_accepted_role_ids()
+        if not accepted:
+            return False
+        for role in getattr(message, "role_mentions", []) or []:
+            role_id = getattr(role, "id", None)
+            if role_id is not None and str(role_id) in accepted:
+                return True
+        content = getattr(message, "content", "") or ""
+        return any(match.group(1) in accepted for match in re.finditer(r"<@&(\d+)>", content))
+
+    def _message_has_invocation_mention(self, message: Any) -> bool:
+        """Return True when the message explicitly invokes this bot.
+
+        Direct bot mentions remain the default. Configured role mentions are
+        also accepted so homelab deployments can invoke Hermes through a role
+        without allowing arbitrary role pings in outbound messages.
+        """
+
+        return self._self_is_explicitly_mentioned(message) or self._has_accepted_role_mention(message)
 
     def _discord_channel_keys(self, message: Any, parent_channel_id: Optional[str] = None) -> set[str]:
         """Return channel identifiers accepted by Discord channel config gates.
@@ -7752,16 +8114,11 @@ class DiscordAdapter(BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
-        if self._self_is_explicitly_mentioned(message):
+        if self._message_has_invocation_mention(message):
             mention_prefix = True
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
-            message.content = normalized_content
-        if self._has_accepted_role_mention(message):
-            mention_prefix = True
-            for role_id in self._discord_accepted_role_ids():
-                normalized_content = normalized_content.replace(f"<@&{role_id}>", "").strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -7808,11 +8165,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if (
-                    not self._self_is_explicitly_mentioned(message)
-                    and not self._has_accepted_role_mention(message)
-                    and not mention_prefix
-                ):
+                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
@@ -9924,6 +10277,13 @@ def interactive_setup() -> None:
             return
 
     print_info("Create a bot at https://discord.com/developers/applications")
+    print_info("On Bot → Privileged Gateway Intents, enable:")
+    print_info("  - Message Content Intent (required — without it Discord rejects the connection)")
+    print_info("  - Server Members Intent (required if you use usernames or role allowlists)")
+    print_info("Save Changes in the Developer Portal before starting the gateway.")
+    print_info(
+        "Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/discord"
+    )
     token = prompt("Discord bot token", password=True)
     if not token:
         return
@@ -10034,19 +10394,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allowed_roles"] = str(allowed_roles_cfg)
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_ROLES"):
             os.environ["DISCORD_ALLOWED_ROLES"] = str(allowed_roles_cfg)
-    mention_roles_cfg = (
-        discord_cfg["mention_role_ids"] if "mention_role_ids" in discord_cfg
-        else discord_cfg["accepted_mention_role_ids"] if "accepted_mention_role_ids" in discord_cfg
-        else platform_extra_cfg.get("mention_role_ids")
-        if "mention_role_ids" in platform_extra_cfg
-        else platform_extra_cfg.get("accepted_mention_role_ids")
-    )
-    if mention_roles_cfg is not None:
-        if isinstance(mention_roles_cfg, list):
-            mention_roles_cfg = ",".join(str(v) for v in mention_roles_cfg)
-        seeded_extra["mention_role_ids"] = str(mention_roles_cfg)
-        if not _skip_env_bridge and not os.getenv("DISCORD_MENTION_ROLE_IDS"):
-            os.environ["DISCORD_MENTION_ROLE_IDS"] = str(mention_roles_cfg)
     allow_all_cfg = (
         discord_cfg["allow_all_users"] if "allow_all_users" in discord_cfg
         else platform_extra_cfg.get("allow_all_users")

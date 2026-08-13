@@ -10,11 +10,11 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 def _role(role_id: str) -> SimpleNamespace:
-    return SimpleNamespace(id=role_id)
+    return SimpleNamespace(id=int(role_id))
 
 
 def _user(*, user_id: str = "111", bot: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(id=user_id, bot=bot)
+    return SimpleNamespace(id=int(user_id), bot=bot)
 
 
 def _message(
@@ -56,6 +56,7 @@ def _adapter(*, extra: dict | None = None) -> DiscordAdapter:
     adapter._discord_thread_require_mention = MagicMock(return_value=False)
     adapter._discord_bots_require_inline_mention = MagicMock(return_value=False)
     adapter._handle_message = AsyncMock(return_value=True)
+    adapter._gate_env_snapshot = {}
     setattr(adapter, "_threads", set())
     adapter._voice_text_channels = {}
     setattr(adapter, "_session_id_for_channel", MagicMock(return_value="session"))
@@ -76,11 +77,6 @@ class TestDiscordAcceptedRoleIds:
         adapter = _adapter()
         with patch.dict("os.environ", {"DISCORD_MENTION_ROLE_IDS": "555,666"}, clear=False):
             assert adapter._discord_accepted_role_ids() == {"555", "666"}
-        with patch.dict("os.environ", {"DISCORD_ACCEPTED_MENTION_ROLE_IDS": "777"}, clear=False):
-            with patch.dict("os.environ", {"DISCORD_MENTION_ROLE_IDS": ""}, clear=False):
-                # Empty primary env is considered configured-empty, matching the
-                # existing Discord list-parsing convention.
-                assert adapter._discord_accepted_role_ids() == set()
         with patch.dict("os.environ", {"DISCORD_ACCEPTED_MENTION_ROLE_IDS": "777"}, clear=True):
             assert adapter._discord_accepted_role_ids() == {"777"}
 
@@ -90,10 +86,16 @@ class TestDiscordRoleMentionAdmission:
         adapter = _adapter(extra={"mention_role_ids": ["999"]})
         msg = _message(role_mentions=[_role("999")])
         assert adapter._has_accepted_role_mention(msg) is True
+        assert adapter._message_has_invocation_mention(msg) is True
+
+    def test_raw_role_mention_is_accepted_invocation(self):
+        adapter = _adapter(extra={"mention_role_ids": ["999"]})
+        msg = _message(content="<@&999> hello", role_mentions=[])
+        assert adapter._has_accepted_role_mention(msg) is True
 
     def test_non_matching_role_is_not_invocation(self):
         adapter = _adapter(extra={"mention_role_ids": ["999"]})
-        msg = _message(role_mentions=[_role("888")])
+        msg = _message(role_mentions=[_role("888")], content="<@&888> hello")
         assert adapter._has_accepted_role_mention(msg) is False
 
     def test_bot_allow_bots_mentions_accepts_configured_role_mention(self):
