@@ -430,8 +430,6 @@ _GATE_ENV_KEYS = (
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
-    "DISCORD_MENTION_ROLE_IDS",
-    "DISCORD_ACCEPTED_MENTION_ROLE_IDS",
     "GATEWAY_ALLOW_ALL_USERS",
     "GATEWAY_ALLOWED_USERS",
 )
@@ -1045,6 +1043,12 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    # Safety ceiling on split deliveries (#86581): a degenerate turn can
+    # produce tens of thousands of characters — without a cap the adapter
+    # posts every 2000-char chunk back-to-back and floods the channel (the
+    # incident delivered 60,698 chars as 31 messages).  Chunks beyond the
+    # cap are replaced by a short notice.
+    MAX_SPLIT_MESSAGES = 8
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -1566,7 +1570,7 @@ class DiscordAdapter(BasePlatformAdapter):
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
-            if allow_bots == "mentions" and not self._message_has_invocation_mention(message):
+            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
@@ -1593,7 +1597,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
-        raw_self_mention = self._message_has_invocation_mention(message)
+        raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
@@ -2686,7 +2690,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
-                and not self._message_has_invocation_mention(message)
+                and not self._self_is_explicitly_mentioned(message)
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(
@@ -3399,6 +3403,29 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not build reply-to reference: %s", e)
             return None
 
+    def _cap_split_chunks(self, chunks: List[str]) -> List[str]:
+        """Cap the number of chunks sent for one logical response (#86581).
+
+        A degenerate turn can produce tens of thousands of characters; the
+        #86581 incident delivered 60,698 chars as 31 back-to-back Discord
+        messages.  When ``chunks`` exceeds ``MAX_SPLIT_MESSAGES``, keep the
+        first ``N-1`` chunks and replace the rest with a short notice so the
+        user sees a clear signal instead of a flood.  The full response
+        remains available in the gateway session history / logs.
+        """
+        if len(chunks) <= self.MAX_SPLIT_MESSAGES:
+            return chunks
+        kept = chunks[: self.MAX_SPLIT_MESSAGES - 1]
+        dropped_chars = sum(len(c) for c in chunks[self.MAX_SPLIT_MESSAGES - 1 :])
+        notice = (
+            f"\n\n⚠️ **Response truncated** — this reply exceeded the "
+            f"delivery limit ({self.MAX_SPLIT_MESSAGES} messages). "
+            f"{dropped_chars} characters were not delivered; the full "
+            f"response is in the session logs."
+        )
+        kept.append(notice)
+        return kept
+
     async def send(
         self,
         chat_id: str,
@@ -3477,7 +3504,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            chunks = self._cap_split_chunks(
+                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            )
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
@@ -3567,7 +3596,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # module — no cross-module import needed.
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        chunks = self._cap_split_chunks(
+            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        )
 
         thread_name = _derive_forum_thread_name(content)
 
@@ -3834,7 +3865,9 @@ class DiscordAdapter(BasePlatformAdapter):
         returns ``success=False`` (a real adapter problem, not overflow).
         """
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        chunks = self._cap_split_chunks(
+            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        )
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
@@ -6747,54 +6780,6 @@ class DiscordAdapter(BasePlatformAdapter):
             "on",
         }
 
-
-    def _discord_accepted_role_ids(self) -> set[str]:
-        """Return Discord role IDs accepted as invocation mentions.
-
-        Config keys (preferred): ``discord.mention_role_ids`` or the older
-        ``discord.accepted_mention_role_ids``. Env fallbacks are
-        ``DISCORD_MENTION_ROLE_IDS`` and ``DISCORD_ACCEPTED_MENTION_ROLE_IDS``.
-        These roles only satisfy the mention/invocation gate; they do not
-        grant user authorization, which remains governed by
-        ``DISCORD_ALLOWED_USERS`` / ``DISCORD_ALLOWED_ROLES``.
-        """
-
-        raw = self.config.extra.get("mention_role_ids")
-        if raw is None:
-            raw = self.config.extra.get("accepted_mention_role_ids")
-        if raw is None:
-            primary = self._gate_env("DISCORD_MENTION_ROLE_IDS")
-            raw = primary if primary != "" else self._gate_env("DISCORD_ACCEPTED_MENTION_ROLE_IDS")
-        if isinstance(raw, (list, tuple, set)):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        text = str(raw or "").strip()
-        if not text:
-            return set()
-        return {part.strip() for part in text.split(",") if part.strip()}
-
-    def _has_accepted_role_mention(self, message: Any) -> bool:
-        """Return True when a message mentions a configured invocation role."""
-
-        accepted = self._discord_accepted_role_ids()
-        if not accepted:
-            return False
-        for role in getattr(message, "role_mentions", []) or []:
-            role_id = getattr(role, "id", None)
-            if role_id is not None and str(role_id) in accepted:
-                return True
-        content = getattr(message, "content", "") or ""
-        return any(match.group(1) in accepted for match in re.finditer(r"<@&(\d+)>", content))
-
-    def _message_has_invocation_mention(self, message: Any) -> bool:
-        """Return True when the message explicitly invokes this bot.
-
-        Direct bot mentions remain the default. Configured role mentions are
-        also accepted so homelab deployments can invoke Hermes through a role
-        without allowing arbitrary role pings in outbound messages.
-        """
-
-        return self._self_is_explicitly_mentioned(message) or self._has_accepted_role_mention(message)
-
     def _discord_channel_keys(self, message: Any, parent_channel_id: Optional[str] = None) -> set[str]:
         """Return channel identifiers accepted by Discord channel config gates.
 
@@ -8114,7 +8099,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
-        if self._message_has_invocation_mention(message):
+        if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
@@ -8579,7 +8564,7 @@ class DiscordAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -9309,12 +9294,12 @@ def _define_discord_view_classes() -> None:
 
         async def _expensive_warning_for(self, model_id: str):
             try:
-                from hermes_cli.model_cost_guard import expensive_model_warning
+                from hermes_cli.model_selection_guards import combined_selection_warning
 
                 # Pricing lookup can hit models.dev / a /models endpoint on a
                 # cache miss — keep it off the event loop.
                 return await asyncio.to_thread(
-                    expensive_model_warning,
+                    combined_selection_warning,
                     model_id,
                     provider=self._selected_provider,
                 )
@@ -9413,7 +9398,7 @@ def _define_discord_view_classes() -> None:
                 self._build_expensive_confirm(model_id)
                 await interaction.response.edit_message(
                     embed=discord.Embed(
-                        title="⚠ Expensive Model Warning",
+                        title=f"⚠ {warning.title}",
                         description=warning.message,
                         color=discord.Color.red(),
                     ),
